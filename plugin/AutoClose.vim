@@ -121,6 +121,18 @@ function! s:CountQuotes(char)
     let l:line = strpart(getline('.'), 0, l:currPos)
     let l:result = 0
 
+    if index(b:AutoCloseDoubleQuoteCommentsFileTypes, &filetype) >= 0 && a:char == '"'
+        let before = l:line[:l:currPos]
+        if before =~ '^\s*$'
+            " they are at the beginning of a line, return 1, causing a " to be
+            " inserted
+            return 1
+        end
+        if before =~ '^\s*"'
+            let l:result -= 1
+        end
+    end
+
     if l:currPos >= 0
         for [q,closer] in items(b:AutoClosePairs)
             " only consider twin pairs
@@ -236,13 +248,28 @@ function! s:ClosePair(closer)
     let l:save_ve = &ve
     set ve=all
 
-    if b:AutoCloseOn && s:GetNextChar() == a:closer
-        call s:EraseNCharsAtCursor(1)
-        call s:PopBuffer()
+    let l:spaces = ''
+
+    if b:AutoCloseOn
+        let l:numChars = 1
+
+        if stridx( b:AutoCloseSkipSpacesOnCloseFor, a:closer ) >= 0
+            while s:GetCharAhead(l:numChars) == " "
+                let l:spaces .= "\<Space>"
+                let l:numChars += 1
+            endwhile
+        endif
+
+        if s:GetCharAhead(l:numChars) == a:closer
+            call s:EraseNCharsAtCursor(l:numChars)
+            for i in range(0,l:numChars)
+                call s:PopBuffer()
+            endfor
+        endif
     endif
 
     exec "set ve=" . l:save_ve
-    return a:closer
+    return l:spaces.a:closer
 endfunction
 
 " in case closer is identical with its opener - heuristically decide which one
@@ -279,17 +306,39 @@ function! s:Backspace()
     let l:next = s:GetNextChar()
     set ve=all
 
-    if b:AutoCloseOn && s:IsEmptyPair() && (l:prev != l:next || s:AllowQuote(l:prev, 1))
-        call s:EraseNCharsAtCursor(1)
-        call s:PopBuffer()
+    let l:return = "\<BS>"
+
+    if b:AutoCloseOn
+        " we're surrounded by spaces, so check one more level out for matching chars
+        if l:prev == " " && l:next == " "
+            let l:prev = s:GetCharBehind(2)
+            let l:next = s:GetCharAhead(2)
+            let l:isEmpty = (l:next != "\0") && (get(b:AutoClosePairs, l:prev, "\0") == l:next)
+
+            if l:isEmpty && stridx( b:AutoCloseExpandSpace, l:prev ) >= 0
+                call s:EraseNCharsAtCursor(1)
+                call s:PopBuffer()
+
+                if b:AutoCloseBackspaceDeleteMatchFirst
+                    let l:return = ""
+                endif
+            endif
+        elseif s:IsEmptyPair() && (l:prev != l:next || s:AllowQuote(l:prev, 1))
+            call s:EraseNCharsAtCursor(1)
+            call s:PopBuffer()
+
+            if b:AutoCloseBackspaceDeleteMatchFirst
+                let l:return = ""
+            endif
+        endif
     endif
 
     exec "set ve=" . l:save_ve
-    return "\<BS>"
+    return l:return
 endfunction
 
 function! s:Space()
-    if b:AutoCloseOn && s:IsEmptyPair()
+    if b:AutoCloseOn && s:IsEmptyPair() && stridx( b:AutoCloseExpandSpace, s:GetPrevChar() ) >= 0
         call s:PushBuffer("\<Space>")
         return "\<Space>\<Space>\<Left>"
     else
@@ -298,13 +347,10 @@ function! s:Space()
 endfunction
 
 function! s:Enter()
-    if has_key(b:AutoClosePumvisible, 'ENTER') && pumvisible()
-        let b:snippet_chosen = 1
-        return b:AutoClosePumvisible['ENTER']
-    elseif b:AutoCloseOn && s:IsEmptyPair() && stridx( b:AutoCloseExpandEnterOn, s:GetPrevChar() ) >= 0
-        return "\<CR>\<Esc>O"
+    if b:AutoCloseOn && s:IsEmptyPair() && stridx( b:AutoCloseExpandEnterOn, s:GetPrevChar() ) >= 0
+        return s:GetUserMapping('ENTER')."\<Esc>O"
     endif
-    return "\<CR>"
+    return s:GetUserMapping('ENTER')
 endfunction
 
 function! s:ToggleAutoClose()
@@ -369,28 +415,12 @@ function! s:DefineVariables()
                 \ 'AutoCloseProtectedRegions': ["Comment", "String", "Character"],
                 \ 'AutoCloseSmartQuote': 1,
                 \ 'AutoCloseOn': 1,
-                \ 'AutoCloseSelectionWrapPrefix': '<LEADER>a',
-                \ 'AutoClosePumvisible': {"ENTER": "\<C-Y>", "ESC": "\<C-E>"},
                 \ 'AutoCloseExpandEnterOn': "",
-                \ 'AutoCloseExpandSpace': 1,
+                \ 'AutoCloseExpandSpace': "({[`\"'",
+                \ 'AutoCloseDoubleQuoteCommentsFileTypes': ["vim"],
+                \ 'AutoCloseBackspaceDeleteMatchFirst': 0,
+                \ 'AutoCloseSkipSpacesOnCloseFor': "",
                 \ }
-
-    " Let the user define if he/she wants the plugin to do special actions when the
-    " popup menu is visible and a movement key is pressed.
-    " Movement keys used in the menu get mapped to themselves
-    " (Up/Down/PageUp/PageDown).
-    for key in s:movementKeys
-        if key == 'ENTER' || key == 'ESC'
-            continue
-        endif
-        let defaults['AutoClosePumvisible'][key] = ''
-    endfor
-    for key in s:pumMovementKeys
-        if key == 'ENTER' || key == 'ESC'
-            continue
-        endif
-        let defaults['AutoClosePumvisible'][key] = '<'.key.'>'
-    endfor
 
     if exists ('b:AutoClosePairs') && type('b:AutoClosePairs') == type("")
         let tmp = AutoClose#ParsePairs(b:AutoClosePairs)
@@ -398,29 +428,29 @@ function! s:DefineVariables()
         let b:AutoClosePairs = tmp
     endif
 
+    if exists('b:AutoCloseExpandSpace') && type(b:AutoCloseExpandSpace) == type(0)
+        if b:AutoCloseExpandSpace == 1
+            let b:AutoCloseExpandSpace = defaults.AutoCloseExpandSpace
+        elseif b:AutoCloseExpandSpace == 0
+            let b:AutoCloseExpandSpace = ""
+        endif
+    endif
+    if exists('g:AutoCloseExpandSpace') && type(g:AutoCloseExpandSpace) == type(0)
+        if g:AutoCloseExpandSpace == 1
+            let b:AutoCloseExpandSpace = defaults.AutoCloseExpandSpace
+        elseif g:AutoCloseExpandSpace == 0
+            let b:AutoCloseExpandSpace = ""
+        endif
+    endif
+
     " Now handle/assign values
     for key in keys(defaults)
-        if key == 'AutoClosePumvisible'
-            let tempVisible = defaults['AutoClosePumvisible']
-            if exists('g:AutoClosePumvisible') && type(eval('g:AutoClosePumvisible')) == type(defaults['AutoClosePumvisible'])
-                for childKey in keys(g:AutoClosePumvisible)
-                    let tempVisible[toupper(childKey)] = g:AutoClosePumvisible[childKey]
-                endfor
-            endif
-            if exists('b:AutoClosePumvisible') && type(eval('b:AutoClosePumvisible')) == type(defaults['AutoClosePumvisible'])
-                for childKey in keys(b:AutoClosePumvisible)
-                    let tempVisible[toupper(childKey)] = b:AutoClosePumvisible[childKey]
-                endfor
-            endif
-            let b:AutoClosePumvisible = tempVisible
+        if exists('b:'.key) && type(eval('b:'.key)) == type(defaults[key])
+            continue
+        elseif exists('g:'.key) && type(eval('g:'.key)) == type(defaults[key])
+            exec 'let b:' . key . ' = g:' . key
         else
-            if exists('b:'.key) && type(eval('b:'.key)) == type(defaults[key])
-                continue
-            elseif exists('g:'.key) && type(eval('g:'.key)) == type(defaults[key])
-                exec 'let b:' . key . ' = g:' . key
-            else
-                exec 'let b:' . key . ' = ' . string(defaults[key])
-            endif
+            exec 'let b:' . key . ' = ' . string(defaults[key])
         endif
     endfor
 endfunction
@@ -433,10 +463,6 @@ function! s:CreatePairsMaps()
         let quoted_opener = s:quoteAndEscape(opener)
         let quoted_closer = s:quoteAndEscape(closer)
 
-        exec "xnoremap <buffer> <silent> ". b:AutoCloseSelectionWrapPrefix
-                    \ . opener . " <Esc>`>a" . closer .  "<Esc>`<i" . opener . "<Esc>"
-        exec "xnoremap <buffer> <silent> ". b:AutoCloseSelectionWrapPrefix
-                    \ . closer . " <Esc>`>a" . closer .  "<Esc>`<i" . opener . "<Esc>"
         if key == b:AutoClosePairs[key]
             exec "inoremap <buffer> <silent> " . opener
                         \ . " <C-R>=<SID>OpenOrCloseTwinPair(" . quoted_opener . ")<CR>"
@@ -449,34 +475,89 @@ function! s:CreatePairsMaps()
     endfor
 endfunction
 
+function! s:GetUserMapping(keyname)
+    if !exists('s:oldMappings')
+        "TODO
+        return ""
+    endif
+
+    let l:old = get(s:oldMappings, a:keyname, '')
+    return "\<Plug>".substitute(l:old, "<Plug>", '','')
+endfunction
+
+function! s:SaveUserMapping(keyname)
+    let l:key = "<".a:keyname.">"
+    if !exists('s:oldMappings')
+        let s:oldMappings = {}
+    endif
+
+    if (get(s:oldMappings, a:keyname, '') != '')
+        " we've already saved this mapping
+        return
+    endif
+
+    " need newer version of vim to use maparg function
+    if v:version >= 704
+        let l:mapping = maparg(l:key,"i",0,1)
+    else
+        let l:mapping = {}
+    endif
+
+    let l:newMappingName = '<Plug>AutocloseOld'.a:keyname
+
+    if l:mapping == {}
+        let l:newMapping = "inoremap ".l:newMappingName." ".l:key
+        "echo l:newMapping
+        exec l:newMapping
+    else
+        " recreate old mapping but map it to our plugin specific mapping
+        let l:newMapping = 'i' . (l:mapping.noremap ? 'nore' : '') . 'map'
+        let l:newMapping .= l:mapping.buffer ? ' <buffer>' : ''
+        let l:newMapping .= l:mapping.silent ? ' <silent>' : ''
+        let l:newMapping .= l:mapping.expr   ? ' <expr>'   : ''
+        let l:newMapping .= l:mapping.nowait ? ' <nowait>' : ''
+        if l:mapping.sid
+            let l:mapping.rhs = substitute(l:mapping.rhs, '<[Ss][Ii][Dd]>', '<SNR>'.l:mapping.sid.'_','g')
+        endif
+        let l:newMapping .= ' '.l:newMappingName
+        let l:newMapping .= ' '.l:mapping.rhs
+
+        "echo l:newMapping
+        exec l:newMapping
+    endif
+
+    let s:oldMappings[a:keyname] = l:newMappingName
+endfunction
+
 function! s:CreateExtraMaps()
     " Extra mapping
     inoremap <buffer> <silent> <BS>         <C-R>=<SID>Backspace()<CR>
     inoremap <buffer> <silent> <Del>        <C-R>=<SID>Delete()<CR>
-    if b:AutoCloseExpandSpace
+    if len(b:AutoCloseExpandSpace) > 0
         inoremap <buffer> <silent> <Space>      <C-R>=<SID>Space()<CR>
     endif
     if len(b:AutoCloseExpandEnterOn) > 0
-        inoremap <buffer> <silent> <CR>      <C-R>=<SID>Enter()<CR>
+        call s:SaveUserMapping('ENTER')
+        exec "imap <buffer> <silent> <expr> <ENTER> (pumvisible() ? '" . s:oldMappings['ENTER'] ."' : <SID>Enter())"
     endif
 
     if g:AutoClosePreserveDotReg
+        inoremap <buffer> <silent> <Plug>AutocloseFlushBuffer <C-R>=<SID>FlushBuffer()<CR>
+
         " Fix the re-do feature by flushing the char buffer on key movements (including Escape):
-        for key in s:movementKeys
-            let l:pvisiblemap = b:AutoClosePumvisible[key]
-            let key = "<".key.">"
-            let l:currentmap = maparg(key,"i")
-            if (l:currentmap=="")|let l:currentmap=key|endif
-            if len(l:pvisiblemap)
-                exec "inoremap <buffer> <silent> <expr> " . key . " pumvisible() ? '" . l:pvisiblemap . "' : '<C-R>=<SID>FlushBuffer()<CR>" . l:currentmap . "'"
+        for keyname in s:movementKeys
+            call s:SaveUserMapping(keyname)
+
+            if index(s:pumMovementKeys, keyname) >= 0
+                exec "imap <buffer> <silent> <expr> " . "<".keyname.">" . " (pumvisible() ? '" . s:oldMappings[keyname] ."' : '<Plug>AutocloseFlushBuffer".s:oldMappings[keyname]."')"
             else
-                exec "inoremap <buffer> <silent> " . key . "  <C-R>=<SID>FlushBuffer()<CR>" . l:currentmap
+                exec "imap <buffer> <silent> <".keyname."> <Plug>AutocloseFlushBuffer".s:oldMappings[keyname]
             endif
         endfor
 
         " Flush the char buffer on mouse click:
-        inoremap <buffer> <silent> <LeftMouse>  <C-R>=<SID>FlushBuffer()<CR><LeftMouse>
-        inoremap <buffer> <silent> <RightMouse> <C-R>=<SID>FlushBuffer()<CR><RightMouse>
+        inoremap <buffer> <silent> <LeftMouse>  <Plug>AutocloseFlushBuffer<LeftMouse>
+        inoremap <buffer> <silent> <RightMouse> <Plug>AutocloseFlushBuffer<RightMouse>
     endif
 endfunction
 
@@ -519,9 +600,10 @@ if !exists("g:AutoClosePairs")
                 \ g:AutoClosePairs_del )
 endif
 
-let s:movementKeys = split('ESC UP DOWN LEFT RIGHT HOME END PAGEUP PAGEDOWN')
-" list of keys that get mapped to themselves for pumvisible()
-let s:pumMovementKeys = split('UP DOWN PAGEUP PAGEDOWN')
+" list of keys to map for the FlushBuffer fn as a part of the re-do feature
+let s:movementKeys    = split('ESC UP DOWN PAGEUP PAGEDOWN LEFT RIGHT HOME END')
+" list of keys that get mapped to themselves for pumvisible because they do other things
+let s:pumMovementKeys = split('ESC UP DOWN PAGEUP PAGEDOWN')
 
 
 if has("gui_macvim")
